@@ -3,12 +3,12 @@ mod dram;
 mod exception;
 mod param;
 mod cpu;
+mod csr;
 
 use std::{env, io};
 use std::fs::File;
 use std::io::Read;
 use crate::cpu::CPU;
-
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -38,6 +38,7 @@ fn main() -> io::Result<()> {
         };
     }
     cpu.dump_registers();
+    cpu.dump_csrs();
     cpu.dump_pc();
 
     Ok(())

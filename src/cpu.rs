@@ -1,6 +1,13 @@
 use crate::bus::Bus;
+use crate::csr::*;
 use crate::exception::Exception;
 use crate::param::{DRAM_BASE, DRAM_END};
+
+type Mode = u64;
+
+const User: Mode = 0b00;
+const Supervisor: Mode = 0b01;
+const Machine: Mode = 0b11;
 
 // The `CPU` struct that contains registers, a program counter, system bus that connects
 pub struct CPU {
@@ -10,6 +17,10 @@ pub struct CPU {
     pub pc: u64,
     // System bus
     pub bus: Bus,
+    // Control and status registers.
+    pub csr: CSR,
+    // mode
+    pub mode: Mode,
 }
 
 const RVABI: [&str; 32] = [
@@ -25,10 +36,14 @@ impl CPU {
         regs[2] = DRAM_END;
         let pc = DRAM_BASE;
         let bus = Bus::new(code);
+        let csr = CSR::new();
+        let mode = Machine;
         Self {
             regs,
             pc,
             bus,
+            csr,
+            mode,
         }
     }
 
@@ -45,6 +60,24 @@ impl CPU {
                     }
                     panic!("Invalid register {}", r);
                 }
+                "mhartid" => self.csr.load(MHARTID),
+                "mstatus" => self.csr.load(MSTATUS),
+                "mtvec" => self.csr.load(MTVEC),
+                "mepc" => self.csr.load(MEPC),
+                "mcause" => self.csr.load(MCAUSE),
+                "mtval" => self.csr.load(MTVAL),
+                "medeleg" => self.csr.load(MEDELEG),
+                "mscratch" => self.csr.load(MSCRATCH),
+                "MIP" => self.csr.load(MIP),
+                "mcounteren" => self.csr.load(MCOUNTEREN),
+                "sstatus" => self.csr.load(SSTATUS),
+                "stvec" => self.csr.load(STVEC),
+                "sepc" => self.csr.load(SEPC),
+                "scause" => self.csr.load(SCAUSE),
+                "stval" => self.csr.load(STVAL),
+                "sscratch" => self.csr.load(SSCRATCH),
+                "SIP" => self.csr.load(SIP),
+                "SATP" => self.csr.load(SATP),
                 _ => panic!("Invalid register {}", r),
             }
         }
@@ -129,6 +162,16 @@ impl CPU {
                         // lwu
                         let val = self.load(addr, 32)?;
                         self.regs[rd] = val;
+                        return self.update_pc();
+                    }
+                    _ => Err(Exception::IllegalInstruction(inst)),
+                }
+            }
+            0x0f => {
+                // A fence instruction does nothing because this emulator executes an
+                // instruction sequentially on a single thread.
+                match funct3 {
+                    0x0 => { // fence
                         return self.update_pc();
                     }
                     _ => Err(Exception::IllegalInstruction(inst)),
@@ -256,6 +299,43 @@ impl CPU {
                     _ => unreachable!(),
                 }
             }
+            0x2f => {
+                // RV64A: "A" standard extension for atomic instructions
+                let funct5 = (funct7 & 0b1111100) >> 2;
+                let _aq = (funct7 & 0b0000010) >> 1; // acquire access
+                let _rl = funct7 & 0b0000001; // release access
+                match (funct3, funct5) {
+                    (0x2, 0x00) => {
+                        // amoadd.w
+                        let t = self.load(self.regs[rs1], 32)?;
+                        self.store(self.regs[rs1], 32, t.wrapping_add(self.regs[rs2]))?;
+                        self.regs[rd] = t;
+                        return self.update_pc();
+                    }
+                    (0x3, 0x00) => {
+                        // amoadd.d
+                        let t = self.load(self.regs[rs1], 64)?;
+                        self.store(self.regs[rs1], 64, t.wrapping_add(self.regs[rs2]))?;
+                        self.regs[rd] = t;
+                        return self.update_pc();
+                    }
+                    (0x2, 0x01) => {
+                        // amoswap.w
+                        let t = self.load(self.regs[rs1], 32)?;
+                        self.store(self.regs[rs1], 32, self.regs[rs2])?;
+                        self.regs[rd] = t;
+                        return self.update_pc();
+                    }
+                    (0x3, 0x01) => {
+                        // amoswap.d
+                        let t = self.load(self.regs[rs1], 64)?;
+                        self.store(self.regs[rs1], 64, self.regs[rs2])?;
+                        self.regs[rd] = t;
+                        return self.update_pc();
+                    }
+                    _ => Err(Exception::IllegalInstruction(inst)),
+                }
+            }
             0x33 => {
                 // "SLL, SRL, and SRA perform logical left, logical right, and arithmetic right
                 // shifts on the value in register rs1 by the shift amount held in register rs2.
@@ -351,9 +431,33 @@ impl CPU {
                         self.regs[rd] = (self.regs[rs1] as u32).wrapping_shr(shamt) as i32 as u64;
                         return self.update_pc();
                     }
+                    (0x5, 0x01) => {
+                        // divu
+                        self.regs[rd] = match self.regs[rs2] {
+                            0 => 0xffffffff_ffffffff,
+                            _ => {
+                                let dividend = self.regs[rs1];
+                                let divisor = self.regs[rs2];
+                                dividend.wrapping_div(divisor)
+                            }
+                        };
+                        return self.update_pc();
+                    }
                     (0x5, 0x20) => {
                         // sraw
                         self.regs[rd] = ((self.regs[rs1] as i32) >> (shamt as i32)) as u64;
+                        return self.update_pc();
+                    }
+                    (0x7, 0x01) => {
+                        // remuw
+                        self.regs[rd] = match self.regs[rs2] {
+                            0 => self.regs[rs1],
+                            _ => {
+                                let dividend = self.regs[rs1] as u32;
+                                let divisor = self.regs[rs2] as u32;
+                                dividend.wrapping_rem(divisor) as i32 as u64
+                            }
+                        };
                         return self.update_pc();
                     }
                     _ => Err(Exception::IllegalInstruction(inst)),
@@ -434,6 +538,109 @@ impl CPU {
 
                 return Ok(self.pc.wrapping_add(imm));
             }
+            0x73 => {
+                let csr_addr = ((inst & 0xfff00000) >> 20) as usize;
+                match funct3 {
+                    0x0 => {
+                        match (rs2, funct7) {
+                            (0x2, 0x8) => {
+                                // sret
+                                // When the SRET instruction is executed to return from the trap
+                                // handler, the privilege level is set to user mode if the SPP
+                                // bit is 0, or supervisor mode if the SPP bit is 1. The SPP bit
+                                // is SSTATUS[8].
+                                let mut sstatus = self.csr.load(SSTATUS);
+                                self.mode = (sstatus & MASK_SPP) >> 8;
+                                // The SPIE bit is SSTATUS[5] and the SIE bit is the SSTATUS[1]
+                                let spie = (sstatus & MASK_SPIE) >> 5;
+                                // set SIE = SPIE
+                                sstatus = (sstatus & !MASK_SIE) | (spie << 1);
+                                // set SPIE = 1
+                                sstatus |= MASK_SPIE;
+                                // set SPP the least privilege mode (u-mode)
+                                sstatus &= !MASK_SPP;
+                                self.csr.store(SSTATUS, sstatus);
+                                // set the pc to CSRs[sepc].
+                                // whenever IALIGN=32, bit sepc[1] is masked on reads so that it appears to be 0. This
+                                // masking occurs also for the implicit read by the SRET instruction.
+                                let new_pc = self.csr.load(SEPC) & !0b11;
+                                return Ok(new_pc);
+                            }
+                            (0x2, 0x18) => {
+                                // mret
+                                let mut mstatus = self.csr.load(MSTATUS);
+                                // MPP is two bits wide at MSTATUS[12:11]
+                                self.mode = (mstatus & MASK_MPP) >> 11;
+                                // The MPIE bit is MSTATUS[7] and the MIE bit is the MSTATUS[3].
+                                let mpie = (mstatus & MASK_MPIE) >> 7;
+                                // set MIE = MPIE
+                                mstatus = (mstatus & !MASK_MIE) | (mpie << 3);
+                                // set MPIE = 1
+                                mstatus |= MASK_MPIE;
+                                // set MPP the least privilege mode (u-mode)
+                                mstatus &= !MASK_MPP;
+                                // If MPP != M, sets MPRV=0
+                                mstatus &= !MASK_MPRV;
+                                self.csr.store(MSTATUS, mstatus);
+                                // set the pc to CSRs[mepc].
+                                let new_pc = self.csr.load(MEPC) & !0b11;
+                                return Ok(new_pc);
+                            }
+                            (_, 0x9) => {
+                                // sfence.vma
+                                // Do nothing.
+                                return self.update_pc();
+                            }
+                            _ => Err(Exception::IllegalInstruction(inst)),
+                        }
+                    }
+                    0x1 => {
+                        // csrrw
+                        let t = self.csr.load(csr_addr);
+                        self.csr.store(csr_addr, self.regs[rs1]);
+                        self.regs[rd] = t;
+                        return self.update_pc();
+                    }
+                    0x2 => {
+                        // csrrs
+                        let t = self.csr.load(csr_addr);
+                        self.csr.store(csr_addr, t | self.regs[rs1]);
+                        self.regs[rd] = t;
+                        return self.update_pc();
+                    }
+                    0x3 => {
+                        // csrrc
+                        let t = self.csr.load(csr_addr);
+                        self.csr.store(csr_addr, t & (!self.regs[rs1]));
+                        self.regs[rd] = t;
+                        return self.update_pc();
+                    }
+                    0x5 => {
+                        // csrrwi
+                        let zimm = rs1 as u64;
+                        self.regs[rd] = self.csr.load(csr_addr);
+                        self.csr.store(csr_addr, zimm);
+                        return self.update_pc();
+                    }
+                    0x6 => {
+                        // csrrsi
+                        let zimm = rs1 as u64;
+                        let t = self.csr.load(csr_addr);
+                        self.csr.store(csr_addr, t | zimm);
+                        self.regs[rd] = t;
+                        return self.update_pc();
+                    }
+                    0x7 => {
+                        // csrrci
+                        let zimm = rs1 as u64;
+                        let t = self.csr.load(csr_addr);
+                        self.csr.store(csr_addr, t & (!zimm));
+                        self.regs[rd] = t;
+                        return self.update_pc();
+                    }
+                    _ => Err(Exception::IllegalInstruction(inst)),
+                }
+            }
             _ => Err(Exception::IllegalInstruction(inst)),
         }
     }
@@ -442,6 +649,11 @@ impl CPU {
     pub fn dump_pc(&self) {
         println!("{:-^80}", "PC register");
         println!("PC = {:#x}\n", self.pc);
+    }
+
+    /// Print values in some csrs.
+    pub fn dump_csrs(&self) {
+        self.csr.dump_csrs();
     }
 
     pub fn dump_registers(&mut self) {
