@@ -24,16 +24,23 @@ fn main() -> io::Result<()> {
         let instr = match cpu.fetch() {
             Ok(instr) => instr,
             Err(e) => {
-                println!("{}", e);
-                break;
+                cpu.handle_exception(e);
+                if e.is_fatal() {
+                    println!("{}", e);
+                    break;
+                }
+                continue;
             }
         };
         match cpu.execute(instr) {
             // Break the loop if an error occurs.
             Ok(new_pc) => cpu.pc = new_pc,
             Err(e) => {
-                println!("{}", e);
-                break;
+                cpu.handle_exception(e);
+                if e.is_fatal() {
+                    println!("{}", e);
+                    break;
+                }
             }
         };
     }
