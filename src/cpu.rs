@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use crate::bus::Bus;
 use crate::csr::*;
 use crate::exception::Exception;

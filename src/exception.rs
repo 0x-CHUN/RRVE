@@ -1,3 +1,4 @@
+#[warn(dead_code)]
 use std::fmt;
 
 #[derive(Debug, Copy, Clone)]

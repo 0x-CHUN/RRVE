@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub const MHARTID: usize = 0xf14;
 /// Machine status register.
 pub const MSTATUS: usize = 0x300;

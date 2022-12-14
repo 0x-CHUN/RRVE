@@ -6,6 +6,7 @@ mod cpu;
 mod csr;
 mod plic;
 mod clint;
+mod uart;
 
 use std::{env, io};
 use std::fs::File;
