@@ -4,6 +4,8 @@ mod exception;
 mod param;
 mod cpu;
 mod csr;
+mod plic;
+mod clint;
 
 use std::{env, io};
 use std::fs::File;
