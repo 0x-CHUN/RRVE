@@ -7,6 +7,7 @@ mod csr;
 mod plic;
 mod clint;
 mod uart;
+mod interrupt;
 
 use std::{env, io};
 use std::fs::File;
@@ -46,6 +47,10 @@ fn main() -> io::Result<()> {
                 }
             }
         };
+        match cpu.check_pending_interrupt() {
+            Some(interrupt) => cpu.handle_interrupt(interrupt),
+            None => ()
+        }
     }
     cpu.dump_registers();
     cpu.dump_csrs();
