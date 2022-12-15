@@ -1,10 +1,12 @@
 #![allow(dead_code)]
 
+use std::mem::size_of;
 use crate::bus::Bus;
 use crate::csr::*;
 use crate::exception::Exception;
 use crate::interrupt::Interrupt;
-use crate::param::{DRAM_BASE, DRAM_END, PLIC_SCLAIM, UART_IRQ};
+use crate::param::{DESC_NUM, DRAM_BASE, DRAM_END, PAGE_SIZE, PLIC_SCLAIM, SECTOR_SIZE, UART_IRQ, VIRTIO_IRQ};
+use crate::virtio::{VirtioBlkRequest, VirtqAvail, VirtqDesc, VirtqUsed};
 
 type Mode = u64;
 
@@ -34,11 +36,11 @@ const RVABI: [&str; 32] = [
 ];
 
 impl CPU {
-    pub fn new(code: Vec<u8>) -> Self {
+    pub fn new(code: Vec<u8>, disk_image: Vec<u8>) -> Self {
         let mut regs = [0; 32];
         regs[2] = DRAM_END;
         let pc = DRAM_BASE;
-        let bus = Bus::new(code);
+        let bus = Bus::new(code, disk_image);
         let csr = CSR::new();
         let mode = Machine;
         Self {
@@ -764,8 +766,11 @@ impl CPU {
         if self.bus.uart.is_interrupting() {
             self.bus.store(PLIC_SCLAIM, 32, UART_IRQ).unwrap();
             self.csr.store(MIP, self.csr.load(MIP) | MASK_SEIP);
+        } else if self.bus.virtio_blk.is_interrupting() {
+            self.disk_access();
+            self.bus.store(PLIC_SCLAIM, 32, VIRTIO_IRQ).unwrap();
+            self.csr.store(MIP, self.csr.load(MIP) | MASK_SEIP);
         }
-        // 3.1.9 & 4.1.3
         // Multiple simultaneous interrupts destined for M-mode are handled in the following decreasing
         // priority order: MEI, MSI, MTI, SEI, SSI, STI.
         let pending = self.csr.load(MIE) & self.csr.load(MIP);
@@ -795,6 +800,68 @@ impl CPU {
             return Some(SupervisorTimerInterrupt);
         }
         return None;
+    }
+
+    pub fn disk_access(&mut self) {
+        const desc_size: u64 = size_of::<VirtqDesc>() as u64;
+        // 2.6.2 Legacy Interfaces: A Note on Virtqueue Layout
+        // ------------------------------------------------------------------
+        // Descriptor Table  | Available Ring | (...padding...) | Used Ring
+        // ------------------------------------------------------------------
+        let desc_addr = self.bus.virtio_blk.desc_addr();
+        let avail_addr = desc_addr + DESC_NUM as u64 * desc_size;
+        let used_addr = desc_addr + PAGE_SIZE;
+
+        // cast addr to a reference to ease field access.
+        let virtq_avail = unsafe { &(*(avail_addr as *const VirtqAvail)) };
+        let virtq_used = unsafe { &(*(used_addr as *const VirtqUsed)) };
+
+        // The idx field of virtq_avail should be indexed into available ring to get the
+        // index of descriptor we need to process.
+        let idx = self.bus.load(&virtq_avail.idx as *const _ as u64, 16).unwrap() as usize;
+        let index = self.bus.load(&virtq_avail.ring[idx % DESC_NUM] as *const _ as u64, 16).unwrap();
+
+        // The first descriptor:
+        // which contains the request information and a pointer to the data descriptor.
+        let desc_addr0 = desc_addr + desc_size * index;
+        let virtq_desc0 = unsafe { &(*(desc_addr0 as *const VirtqDesc)) };
+        // The addr field points to a virtio block request. We need the sector number stored
+        // in the sector field. The iotype tells us whether to read or write.
+        let req_addr = self.bus.load(&virtq_desc0.addr as *const _ as u64, 64).unwrap();
+        let virtq_blk_req = unsafe { &(*(req_addr as *const VirtioBlkRequest)) };
+        let blk_sector = self.bus.load(&virtq_blk_req.sector as *const _ as u64, 64).unwrap();
+        let iotype = self.bus.load(&virtq_blk_req.iotype as *const _ as u64, 32).unwrap() as u32;
+        // The next field points to the second descriptor. (data descriptor)
+        let next0 = self.bus.load(&virtq_desc0.next as *const _ as u64, 16).unwrap();
+
+        // the second descriptor.
+        let desc_addr1 = desc_addr + desc_size * next0;
+        let virtq_desc1 = unsafe { &(*(desc_addr1 as *const VirtqDesc)) };
+        // The addr field points to the data to read or write
+        let addr1 = self.bus.load(&virtq_desc1.addr as *const _ as u64, 64).unwrap();
+        // the len donates the size of the data
+        let len1 = self.bus.load(&virtq_desc1.len as *const _ as u64, 32).unwrap();
+        // the flags mark this buffer as device write-only or read-only.
+        // We ignore it here
+        // let flags1 = self.bus.load(&virtq_desc1.flags as *const _ as u64, 16).unwrap();
+        match iotype {
+            VIRTIO_BLK_T_OUT => {
+                for i in 0..len1 {
+                    let data = self.bus.load(addr1 + i, 8).unwrap();
+                    self.bus.virtio_blk.write_disk(blk_sector * SECTOR_SIZE + i, data);
+                }
+            }
+            VIRTIO_BLK_T_IN => {
+                for i in 0..len1 {
+                    let data = self.bus.virtio_blk.read_disk(blk_sector * SECTOR_SIZE + i);
+                    self.bus.store(addr1 + i, 8, data as u64).unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+
+        let new_id = self.bus.virtio_blk.get_new_id();
+        self.bus.store(&virtq_used.idx as *const _ as u64, 16, new_id % 8).unwrap();
     }
 
     pub fn dump_pc(&self) {
